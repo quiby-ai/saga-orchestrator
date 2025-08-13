@@ -1,2 +1,2 @@
 # saga-orchestrator
-Distributed Saga orchestrator for coordinating Quiby's event-driven review processing pipeline.
+Distributed Saga orchestrator coordinating the reviews pipeline via Saga over Kafka using `segmentio/kafka-go`.

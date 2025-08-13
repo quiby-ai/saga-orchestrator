@@ -1,0 +1,18 @@
+app_id = "saga-orchestrator"
+app_env = "dev"
+
+kafka_brokers = ["localhost:9092"]
+kafka_group_orchestrator = "saga-orchestrator-orc"
+
+topic_extract_request = "pipeline.extract_reviews.request"
+topic_extract_completed = "pipeline.extract_reviews.completed"
+topic_prepare_request = "pipeline.prepare_reviews.request"
+topic_prepare_completed = "pipeline.prepare_reviews.completed"
+topic_pipeline_failed = "pipeline.failed"
+topic_state_changed = "saga.orchestrator.state.changed"
+
+http_addr = ":8082"
+
+postgres_url = "postgres://postgres:postgres@localhost:5432/saga?sslmode=disable"
+
+categorize_enabled = false
