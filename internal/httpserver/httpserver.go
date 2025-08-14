@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/segmentio/kafka-go"
 
+	"github.com/quiby-ai/common/pkg/events"
 	"github.com/quiby-ai/saga-orchestrator/internal/config"
-	"github.com/quiby-ai/saga-orchestrator/internal/types"
+	"github.com/quiby-ai/saga-orchestrator/internal/utils"
 )
 
 type Server struct {
@@ -22,10 +22,10 @@ type Server struct {
 }
 
 type orkPublisher interface {
-	Publish(ctx context.Context, topic string, key []byte, value []byte, headers []kafka.Header) error
+	PublishEvent(ctx context.Context, topic string, key []byte, envelope events.Envelope[any]) error
 }
 
-func NewServer(cfg config.Config, db *sql.DB) *Server { // producer will be injected later via setter
+func NewServer(cfg config.Config, db *sql.DB) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
 		cfg: cfg,
@@ -58,14 +58,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // InjectProducer allows wiring after creation
 func (s *Server) InjectProducer(p orkPublisher) { s.prod = p }
 
-type startRequest struct {
-	AppID     string   `json:"app_id"`
-	AppName   string   `json:"app_name"`
-	Countries []string `json:"countries"`
-	DateFrom  string   `json:"date_from"`
-	DateTo    string   `json:"date_to"`
-}
-
 type startResponse struct {
 	SagaID string `json:"saga_id"`
 	Status string `json:"status"`
@@ -84,7 +76,7 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req startRequest
+	var req events.ExtractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("invalid json"))
@@ -95,18 +87,17 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 	traceID := ""
 	now := time.Now().UTC()
 
-	// idempotency: return existing saga if key exists
 	var existingSaga string
 	_ = s.db.QueryRowContext(r.Context(), `SELECT saga_id FROM idempotency_keys WHERE key=$1`, idemKey).Scan(&existingSaga)
 	if existingSaga != "" {
-		writeJSON(w, http.StatusOK, startResponse{SagaID: existingSaga, Status: "running"})
+		utils.WriteJSON(w, http.StatusOK, startResponse{SagaID: existingSaga, Status: "running"})
 		return
 	}
 
-	err := s.withTx(r.Context(), func(tx *sql.Tx) error {
+	err := utils.WithTx(r.Context(), s.db, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(r.Context(),
 			`INSERT INTO saga_instances(saga_id, status, current_step, trace_id, input) VALUES ($1,'running','extract',$2,$3)`,
-			sagaID, traceID, jsonMustMarshal(req)); err != nil {
+			sagaID, traceID, utils.MustMarshal(req)); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(r.Context(),
@@ -117,8 +108,8 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		// if duplicate idempotency key, return 200 with some generic response
-		if isUniqueViolation(err) {
-			writeJSON(w, http.StatusOK, startResponse{SagaID: sagaID, Status: "running"})
+		if utils.IsUniqueViolation(err) {
+			utils.WriteJSON(w, http.StatusOK, startResponse{SagaID: sagaID, Status: "running"})
 			return
 		}
 		w.WriteHeader(http.StatusInternalServerError)
@@ -126,70 +117,48 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish state.changed running and extract.request event
-	stateEnv := types.Envelope{MessageID: uuid.NewString(), SagaID: sagaID, Type: s.cfg.TopicStateChanged, OccurredAt: now,
-		Payload: jsonMustMarshal(map[string]any{"payload": map[string]any{"status": "running", "step": "extract"}}),
-		Meta:    types.Meta{AppID: s.cfg.AppID, TenantID: tenantID, Initiator: "user", SchemaVersion: "v1"}}
-	stateValue, _ := json.Marshal(stateEnv)
-	if s.prod != nil {
-		_ = s.prod.Publish(r.Context(), s.cfg.TopicStateChanged, []byte(sagaID), stateValue, []kafka.Header{{Key: "type", Value: []byte(stateEnv.Type)}, {Key: "saga_id", Value: []byte(sagaID)}})
+	stateEnv := events.Envelope[events.StateChanged]{
+		MessageID:  uuid.NewString(),
+		SagaID:     sagaID,
+		Type:       events.SagaStateChanged,
+		OccurredAt: now,
+		Payload: events.StateChanged{
+			Status: events.SagaStatusRunning,
+			Step:   events.SagaStepExtract,
+			// TODO: move to texts dictionary
+			Context: events.StateChangedContext{Message: "Quiby is extracting reviews..."},
+		},
+		Meta: events.Meta{
+			AppID:         s.cfg.AppID,
+			TenantID:      tenantID,
+			Initiator:     events.InitiatorUser,
+			SchemaVersion: events.SchemaVersionV1,
+		},
 	}
 
-	// Publish extract.request event
-	env := types.Envelope{
+	if s.prod != nil {
+		genericEnv := utils.ToGenericEnvelope(stateEnv)
+		_ = s.prod.PublishEvent(r.Context(), s.cfg.TopicStateChanged, []byte(sagaID), genericEnv)
+	}
+
+	env := events.Envelope[events.ExtractRequest]{
 		MessageID:  uuid.NewString(),
 		SagaID:     sagaID,
 		Type:       s.cfg.TopicExtractRequest,
 		OccurredAt: now,
-		Payload:    jsonMustMarshal(req),
-		Meta:       types.Meta{AppID: s.cfg.AppID, TenantID: tenantID, Initiator: "user", SchemaVersion: "v1"},
+		Payload:    req,
+		Meta: events.Meta{
+			AppID:         s.cfg.AppID,
+			TenantID:      tenantID,
+			Initiator:     events.InitiatorUser,
+			SchemaVersion: events.SchemaVersionV1,
+		},
 	}
-	value, _ := json.Marshal(env)
-	headers := []kafka.Header{
-		{Key: "message_id", Value: []byte(env.MessageID)},
-		{Key: "saga_id", Value: []byte(env.SagaID)},
-		{Key: "type", Value: []byte(env.Type)},
-		{Key: "schema_version", Value: []byte(env.Meta.SchemaVersion)},
-	}
+
 	if s.prod != nil {
-		_ = s.prod.Publish(r.Context(), s.cfg.TopicExtractRequest, []byte(env.SagaID), value, headers)
+		genericEnv := utils.ToGenericEnvelope(env)
+		_ = s.prod.PublishEvent(r.Context(), s.cfg.TopicExtractRequest, []byte(env.SagaID), genericEnv)
 	}
 
-	writeJSON(w, http.StatusOK, startResponse{SagaID: sagaID, Status: "running"})
-}
-
-func (s *Server) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func jsonMustMarshal(v any) []byte { b, _ := json.Marshal(v); return b }
-
-func isUniqueViolation(err error) bool {
-	return err != nil && (contains(err.Error(), "duplicate key") || contains(err.Error(), "unique"))
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
+	utils.WriteJSON(w, http.StatusOK, startResponse{SagaID: sagaID, Status: "running"})
 }

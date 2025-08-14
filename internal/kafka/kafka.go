@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/quiby-ai/common/pkg/events"
 	"github.com/segmentio/kafka-go"
 
 	"github.com/quiby-ai/saga-orchestrator/internal/config"
@@ -27,12 +28,27 @@ func NewProducer(cfg config.Config) *Producer {
 
 func (p *Producer) Close() error { return p.w.Close() }
 
-func (p *Producer) Publish(ctx context.Context, topic string, key []byte, value []byte, headers []kafka.Header) error {
+// PublishEvent publishes an event envelope with proper Kafka headers
+func (p *Producer) PublishEvent(ctx context.Context, topic string, key []byte, envelope events.Envelope[any]) error {
+	value, err := events.MarshalEnvelope(envelope)
+	if err != nil {
+		return fmt.Errorf("marshal envelope: %w", err)
+	}
+
+	// Convert envelope headers to Kafka headers
+	kafkaHeaders := make([]kafka.Header, 0, len(envelope.KafkaHeaders()))
+	for _, h := range envelope.KafkaHeaders() {
+		kafkaHeaders = append(kafkaHeaders, kafka.Header{
+			Key:   h.Key,
+			Value: h.Value,
+		})
+	}
+
 	msg := kafka.Message{
 		Topic:   topic,
 		Key:     key,
 		Value:   value,
-		Headers: headers,
+		Headers: kafkaHeaders,
 		Time:    time.Now(),
 	}
 	return p.w.WriteMessages(ctx, msg)

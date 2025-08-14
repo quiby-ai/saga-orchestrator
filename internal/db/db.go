@@ -40,7 +40,9 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	for _, f := range files {
-		if f.IsDir() { continue }
+		if f.IsDir() {
+			continue
+		}
 		content, err := migrationsFS.ReadFile("migrations/" + f.Name())
 		if err != nil {
 			return err
@@ -53,19 +55,3 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 }
 
 var ErrDuplicate = errors.New("duplicate")
-
-func WithTx(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) error {
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil { return err }
-	defer func() {
-		if tx != nil {
-			_ = tx.Rollback()
-		}
-	}()
-	if err := fn(tx); err != nil { return err }
-	if err := tx.Commit(); err != nil { return err }
-	tx = nil
-	return nil
-}
-
-

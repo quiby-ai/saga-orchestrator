@@ -5,6 +5,7 @@ go 1.24.1
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.5
+	github.com/quiby-ai/common v0.0.0-20250814070145-3e77839679a9
 	github.com/segmentio/kafka-go v0.4.48
 	github.com/spf13/viper v1.20.1
 )
