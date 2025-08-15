@@ -8,9 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/quiby-ai/common/pkg/events"
-
 	"github.com/google/uuid"
+	"github.com/quiby-ai/common/pkg/events"
 	"github.com/segmentio/kafka-go"
 
 	"github.com/quiby-ai/saga-orchestrator/internal/config"
@@ -19,200 +18,181 @@ import (
 	"github.com/quiby-ai/saga-orchestrator/internal/utils"
 )
 
+// Orchestrator handles saga orchestration logic
 type Orchestrator struct {
 	cfg config.Config
 	db  *sql.DB
 	p   producer
 }
 
+// producer interface for publishing events
 type producer interface {
 	PublishEvent(ctx context.Context, topic string, key []byte, envelope events.Envelope[any]) error
 }
 
+// NewOrchestrator creates a new orchestrator instance
 func NewOrchestrator(cfg config.Config, db *sql.DB, p producer) *Orchestrator {
-	return &Orchestrator{cfg: cfg, db: db, p: p}
+	return &Orchestrator{
+		cfg: cfg,
+		db:  db,
+		p:   p,
+	}
 }
 
+// HandleMessage processes incoming Kafka messages
 func (o *Orchestrator) HandleMessage(ctx context.Context, msg kafka.Message) error {
-	// First unmarshal to get the basic envelope structure
+	// Check if message was already processed
+	if err := o.checkMessageProcessed(ctx, msg); err != nil {
+		return err
+	}
+
+	// Parse message type and route to appropriate handler
+	return o.routeMessage(ctx, msg)
+}
+
+// checkMessageProcessed ensures message hasn't been processed before
+func (o *Orchestrator) checkMessageProcessed(ctx context.Context, msg kafka.Message) error {
+	messageID := utils.GetHeader(msg, "message_id")
+	if messageID == "" {
+		return nil // No message ID, proceed normally
+	}
+
+	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
+		if err := o.ensureProcessedNotExists(ctx, tx, messageID); err != nil {
+			if errors.Is(err, db.ErrDuplicate) {
+				return db.ErrDuplicate // Signal that message was already processed
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// routeMessage routes the message to the appropriate handler based on type
+func (o *Orchestrator) routeMessage(ctx context.Context, msg kafka.Message) error {
 	var baseEnvelope struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(msg.Value, &baseEnvelope); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal base envelope: %w", err)
 	}
 
-	var alreadyProcessed bool
-	messageID := utils.GetHeader(msg, "message_id")
-	if messageID != "" {
-		if err := utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
-			if err := o.ensureProcessedNotExists(ctx, tx, messageID); err != nil {
-				if errors.Is(err, db.ErrDuplicate) {
-					alreadyProcessed = true
-					return nil
-				}
-				return err
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	if alreadyProcessed {
-		return nil
+	handlers := map[string]func(context.Context, []byte) error{
+		events.PipelineExtractCompleted: o.handleExtractCompleted,
+		events.PipelinePrepareCompleted: o.handlePrepareCompleted,
+		events.PipelineFailed:           o.handlePipelineFailed,
 	}
 
-	// Handle only completed/failed events with proper type handling
-	switch baseEnvelope.Type {
-	case events.PipelineExtractCompleted:
-		envelope, err := events.UnmarshalEnvelope[events.ExtractCompleted](msg.Value)
-		if err != nil {
-			return err
-		}
-		if err = o.onExtractCompleted(ctx, envelope); err != nil {
-			return err
-		}
-	case events.PipelinePrepareCompleted:
-		envelope, err := events.UnmarshalEnvelope[events.PrepareCompleted](msg.Value)
-		if err != nil {
-			return err
-		}
-		if err = o.onPrepareCompleted(ctx, envelope); err != nil {
-			return err
-		}
-	case events.PipelineFailed:
-		envelope, err := events.UnmarshalEnvelope[events.Failed](msg.Value)
-		if err != nil {
-			return err
-		}
-		if err = o.onPipelineFailed(ctx, envelope); err != nil {
-			return err
-		}
-	default:
+	handler, exists := handlers[baseEnvelope.Type]
+	if !exists {
 		return fmt.Errorf("unknown message type: %s", baseEnvelope.Type)
 	}
-	return nil
+
+	return handler(ctx, msg.Value)
 }
 
-type IncomingEventType interface {
-	events.ExtractCompleted | events.PrepareCompleted | events.Failed
-}
-
-func (o *Orchestrator) onExtractCompleted(ctx context.Context, env events.Envelope[events.ExtractCompleted]) error {
-	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
-		genericEnv := utils.ToGenericEnvelope(env)
-
-		if err := appendEvent(ctx, tx, env, env.Payload); err != nil {
-			return err
-		}
-
-		// TODO: move it to constructor (if needed)
-		repo := storage.NewSagaInstancesRepo(tx)
-		sagaUUID, err := uuid.Parse(env.SagaID)
-		if err != nil {
-			return fmt.Errorf("invalid saga ID format: %w", err)
-		}
-
-		payloadJSON := utils.AsJSON(env.Payload)
-		var rawPayload json.RawMessage
-		if payloadJSON != nil {
-			rawPayload = json.RawMessage(*payloadJSON)
-		}
-
-		if err := repo.UpdateSagaInstanceStep(ctx, sagaUUID, "prepare", "running", rawPayload); err != nil {
-			return err
-		}
-
-		payloadBytes, _ := json.Marshal(env.Payload)
-		if err := o.publishNext(ctx, genericEnv, events.PipelinePrepareRequest, payloadBytes); err != nil {
-			return err
-		}
-		return o.publishStateChanged(ctx, env.SagaID, events.SagaStatusRunning, events.SagaStepPrepare, payloadBytes)
-	})
-}
-
-func (o *Orchestrator) onPrepareCompleted(ctx context.Context, env events.Envelope[events.PrepareCompleted]) error {
-	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
-		if err := appendEvent(ctx, tx, env, env.Payload); err != nil {
-			return err
-		}
-
-		repo := storage.NewSagaInstancesRepo(tx)
-		sagaUUID, err := uuid.Parse(env.SagaID)
-		if err != nil {
-			return fmt.Errorf("invalid saga ID format: %w", err)
-		}
-
-		payloadJSON := utils.AsJSON(env.Payload)
-		var rawPayload json.RawMessage
-		if payloadJSON != nil {
-			rawPayload = json.RawMessage(*payloadJSON)
-		}
-
-		if err := repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusCompleted, rawPayload); err != nil {
-			return err
-		}
-		payloadBytes, _ := json.Marshal(env.Payload)
-		return o.publishStateChanged(ctx, env.SagaID, events.SagaStatusCompleted, events.SagaStepPrepare, payloadBytes)
-	})
-}
-
-func (o *Orchestrator) onPipelineFailed(ctx context.Context, env events.Envelope[events.Failed]) error {
-	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
-		if err := appendEvent(ctx, tx, env, env.Payload); err != nil {
-			return err
-		}
-		repo := storage.NewSagaInstancesRepo(tx)
-		sagaUUID, err := uuid.Parse(env.SagaID)
-		if err != nil {
-			return fmt.Errorf("invalid saga ID format: %w", err)
-		}
-
-		payloadJSON := utils.AsJSON(env.Payload)
-		var rawPayload json.RawMessage
-		if payloadJSON != nil {
-			rawPayload = json.RawMessage(*payloadJSON)
-		}
-
-		if err := repo.UpdateSagaInstanceStatus(ctx, sagaUUID, events.SagaStatusFailed, rawPayload); err != nil {
-			return err
-		}
-		payloadBytes, _ := json.Marshal(env.Payload)
-		// TODO: keep step empty or filled
-		return o.publishStateChanged(ctx, env.SagaID, events.SagaStatusFailed, "", payloadBytes)
-	})
-}
-
-func (o *Orchestrator) ensureProcessedNotExists(ctx context.Context, tx *sql.Tx, messageID string) error {
-	repo := storage.NewProcessedMessagesRepo(tx)
-	messageUUID, err := uuid.Parse(messageID)
+// handleExtractCompleted processes extract completed events
+func (o *Orchestrator) handleExtractCompleted(ctx context.Context, msgValue []byte) error {
+	envelope, err := events.UnmarshalEnvelope[events.ExtractCompleted](msgValue)
 	if err != nil {
-		return fmt.Errorf("invalid message ID format: %w", err)
+		return fmt.Errorf("failed to unmarshal extract completed envelope: %w", err)
 	}
 
-	if err := repo.InsertProcessedMessage(ctx, messageUUID); err != nil {
-		if utils.IsUniqueViolation(err) {
-			return db.ErrDuplicate
-		}
-		return err
-	}
-	return nil
+	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
+		repo := storage.NewSagaInstancesRepo(tx)
+		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusRunning, payload)
+	}, events.SagaStatusRunning, events.SagaStepPrepare)
 }
 
-func appendEvent[T IncomingEventType](ctx context.Context, tx *sql.Tx, env events.Envelope[T], payload T) error {
+// handlePrepareCompleted processes prepare completed events
+func (o *Orchestrator) handlePrepareCompleted(ctx context.Context, msgValue []byte) error {
+	envelope, err := events.UnmarshalEnvelope[events.PrepareCompleted](msgValue)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal prepare completed envelope: %w", err)
+	}
+
+	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
+		repo := storage.NewSagaInstancesRepo(tx)
+		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusCompleted, payload)
+	}, events.SagaStatusCompleted, events.SagaStepPrepare)
+}
+
+// handlePipelineFailed processes pipeline failed events
+func (o *Orchestrator) handlePipelineFailed(ctx context.Context, msgValue []byte) error {
+	envelope, err := events.UnmarshalEnvelope[events.Failed](msgValue)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal pipeline failed envelope: %w", err)
+	}
+
+	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
+		repo := storage.NewSagaInstancesRepo(tx)
+		return repo.UpdateSagaInstanceStatus(ctx, sagaUUID, events.SagaStatusFailed, payload)
+	}, events.SagaStatusFailed, "")
+}
+
+// convertToAnyEnvelope converts a typed envelope to an any envelope
+func convertToAnyEnvelope[T any](env events.Envelope[T]) events.Envelope[any] {
+	return events.Envelope[any]{
+		MessageID:  env.MessageID,
+		TraceID:    env.TraceID,
+		SagaID:     env.SagaID,
+		Type:       env.Type,
+		OccurredAt: env.OccurredAt,
+		Payload:    env.Payload,
+		Meta:       env.Meta,
+	}
+}
+
+// processSagaEvent is a common helper for processing saga events
+func (o *Orchestrator) processSagaEvent(
+	ctx context.Context,
+	env events.Envelope[any],
+	updateFn func(context.Context, *sql.Tx, uuid.UUID, json.RawMessage) error,
+	status events.SagaStatus,
+	step events.SagaStep,
+) error {
+	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
+		// Store the event
+		if err := o.appendEvent(ctx, tx, env); err != nil {
+			return fmt.Errorf("failed to append event: %w", err)
+		}
+
+		// Update saga instance
+		sagaUUID, err := uuid.Parse(env.SagaID)
+		if err != nil {
+			return fmt.Errorf("invalid saga ID format: %w", err)
+		}
+
+		payloadJSON := utils.AsJSON(env.Payload)
+		var rawPayload json.RawMessage
+		if payloadJSON != nil {
+			rawPayload = json.RawMessage(*payloadJSON)
+		}
+
+		if err = updateFn(ctx, tx, sagaUUID, rawPayload); err != nil {
+			return fmt.Errorf("failed to update saga instance: %w", err)
+		}
+
+		// Publish state change
+		return o.publishStateChanged(ctx, env.SagaID, status, step, rawPayload)
+	})
+}
+
+// appendEvent stores a saga event in the database
+func (o *Orchestrator) appendEvent(ctx context.Context, tx *sql.Tx, env events.Envelope[any]) error {
 	repo := storage.NewSagaRepo(tx)
 
 	sagaUUID, err := uuid.Parse(env.SagaID)
 	if err != nil {
-		return fmt.Errorf("invalid saga ID format: %w", err)
+		return fmt.Errorf("failed to append event: %w", err)
 	}
 
 	messageUUID, err := uuid.Parse(env.MessageID)
 	if err != nil {
-		return fmt.Errorf("invalid message ID format: %w", err)
+		return fmt.Errorf("failed to append event: %w", err)
 	}
 
-	payloadJSON := utils.AsJSON(payload)
+	payloadJSON := utils.AsJSON(env.Payload)
 	var rawPayload json.RawMessage
 	if payloadJSON != nil {
 		rawPayload = json.RawMessage(*payloadJSON)
@@ -227,58 +207,61 @@ func appendEvent[T IncomingEventType](ctx context.Context, tx *sql.Tx, env event
 	})
 }
 
-func (o *Orchestrator) publishNext(ctx context.Context, env events.Envelope[any], topic string, payload json.RawMessage) error {
-	// TODO: update any to exact type
-	out := events.Envelope[any]{
-		MessageID:  uuid.NewString(),
-		TraceID:    env.TraceID,
-		SagaID:     env.SagaID,
-		Type:       topic,
-		OccurredAt: time.Now().UTC(),
-		Payload:    payload,
-		Meta: events.Meta{
-			AppID:         o.cfg.AppID,
-			TenantID:      env.Meta.TenantID,
-			Initiator:     env.Meta.Initiator,
-			SchemaVersion: events.SchemaVersionV1,
-		},
+// ensureProcessedNotExists ensures a message hasn't been processed before
+func (o *Orchestrator) ensureProcessedNotExists(ctx context.Context, tx *sql.Tx, messageID string) error {
+	repo := storage.NewProcessedMessagesRepo(tx)
+	messageUUID, err := uuid.Parse(messageID)
+	if err != nil {
+		return fmt.Errorf("invalid message ID format: %w", err)
 	}
-	return o.publish(ctx, topic, out)
+
+	if err := repo.InsertProcessedMessage(ctx, messageUUID); err != nil {
+		if utils.IsUniqueViolation(err) {
+			return db.ErrDuplicate
+		}
+		return fmt.Errorf("failed to insert processed message: %w", err)
+	}
+	return nil
 }
 
-func (o *Orchestrator) publishStateChanged(ctx context.Context, envSagaID string, status events.SagaStatus, step events.SagaStep, contextPayload json.RawMessage) error {
+// publishStateChanged publishes a state change event
+func (o *Orchestrator) publishStateChanged(ctx context.Context, sagaID string, status events.SagaStatus, step events.SagaStep, contextPayload json.RawMessage) error {
 	payload := map[string]any{
 		"status": status,
 		"step":   step,
 	}
 
-	var ctxMap map[string]any
-	_ = json.Unmarshal(contextPayload, &ctxMap)
-	if ctxMap != nil {
-		contextObj := map[string]any{}
-		if v, ok := ctxMap["count"]; ok {
-			contextObj["count"] = v
-		}
-		if len(contextObj) > 0 {
-			payload["context"] = contextObj
+	// Extract context if available
+	if contextPayload != nil {
+		var ctxMap map[string]any
+		if err := json.Unmarshal(contextPayload, &ctxMap); err == nil {
+			if count, ok := ctxMap["count"]; ok {
+				payload["context"] = map[string]any{"count": count}
+			}
 		}
 	}
-	// TODO: handle any to exact type
-	b, _ := json.Marshal(map[string]any{"payload": payload})
-	out := events.Envelope[any]{
+
+	payloadBytes, err := json.Marshal(map[string]any{"payload": payload})
+	if err != nil {
+		return fmt.Errorf("failed to marshal state change payload: %w", err)
+	}
+
+	envelope := events.Envelope[any]{
 		MessageID:  uuid.NewString(),
-		SagaID:     envSagaID,
+		SagaID:     sagaID,
 		Type:       o.cfg.TopicStateChanged,
 		OccurredAt: time.Now().UTC(),
-		Payload:    b,
+		Payload:    payloadBytes,
 		Meta: events.Meta{
 			AppID:         o.cfg.AppID,
 			SchemaVersion: events.SchemaVersionV1,
 		},
 	}
-	return o.publish(ctx, o.cfg.TopicStateChanged, out)
+
+	return o.publish(ctx, o.cfg.TopicStateChanged, envelope)
 }
 
+// publish publishes an event to Kafka
 func (o *Orchestrator) publish(ctx context.Context, topic string, env events.Envelope[any]) error {
 	key := []byte(env.SagaID)
 	return o.p.PublishEvent(ctx, topic, key, env)

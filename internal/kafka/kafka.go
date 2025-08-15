@@ -91,7 +91,7 @@ func RunConsumerLoop(ctx context.Context, c *Consumer, handler func(context.Cont
 			_ = c.r.CommitMessages(ctx, m)
 			continue
 		}
-		if err := c.r.CommitMessages(ctx, m); err != nil {
+		if err = c.r.CommitMessages(ctx, m); err != nil {
 			return fmt.Errorf("commit: %w", err)
 		}
 	}
