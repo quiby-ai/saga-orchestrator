@@ -15,8 +15,19 @@ import (
 
 	"github.com/quiby-ai/saga-orchestrator/internal/config"
 	"github.com/quiby-ai/saga-orchestrator/internal/db"
+	"github.com/quiby-ai/saga-orchestrator/internal/storage"
 	"github.com/quiby-ai/saga-orchestrator/internal/utils"
 )
+
+type Orchestrator struct {
+	cfg config.Config
+	db  *sql.DB
+	p   producer
+}
+
+type producer interface {
+	PublishEvent(ctx context.Context, topic string, key []byte, envelope events.Envelope[any]) error
+}
 
 func NewOrchestrator(cfg config.Config, db *sql.DB, p producer) *Orchestrator {
 	return &Orchestrator{cfg: cfg, db: db, p: p}
@@ -24,10 +35,10 @@ func NewOrchestrator(cfg config.Config, db *sql.DB, p producer) *Orchestrator {
 
 func (o *Orchestrator) HandleMessage(ctx context.Context, msg kafka.Message) error {
 	// First unmarshal to get the basic envelope structure
-	var baseEnv struct {
+	var baseEnvelope struct {
 		Type string `json:"type"`
 	}
-	if err := json.Unmarshal(msg.Value, &baseEnv); err != nil {
+	if err := json.Unmarshal(msg.Value, &baseEnvelope); err != nil {
 		return err
 	}
 
@@ -52,94 +63,134 @@ func (o *Orchestrator) HandleMessage(ctx context.Context, msg kafka.Message) err
 	}
 
 	// Handle only completed/failed events with proper type handling
-	switch baseEnv.Type {
-	case o.cfg.TopicExtractCompleted:
-		var env events.Envelope[events.ExtractCompleted]
-		if err := json.Unmarshal(msg.Value, &env); err != nil {
+	switch baseEnvelope.Type {
+	case events.PipelineExtractCompleted:
+		envelope, err := events.UnmarshalEnvelope[events.ExtractCompleted](msg.Value)
+		if err != nil {
 			return err
 		}
-		if err := o.onExtractCompleted(ctx, env); err != nil {
+		if err = o.onExtractCompleted(ctx, envelope); err != nil {
 			return err
 		}
-	case o.cfg.TopicPrepareCompleted:
-		var env events.Envelope[events.PrepareCompleted]
-		if err := json.Unmarshal(msg.Value, &env); err != nil {
+	case events.PipelinePrepareCompleted:
+		envelope, err := events.UnmarshalEnvelope[events.PrepareCompleted](msg.Value)
+		if err != nil {
 			return err
 		}
-		if err := o.onPrepareCompleted(ctx, env); err != nil {
+		if err = o.onPrepareCompleted(ctx, envelope); err != nil {
 			return err
 		}
-	case o.cfg.TopicPipelineFailed:
-		var env events.Envelope[events.Failed]
-		if err := json.Unmarshal(msg.Value, &env); err != nil {
+	case events.PipelineFailed:
+		envelope, err := events.UnmarshalEnvelope[events.Failed](msg.Value)
+		if err != nil {
 			return err
 		}
-		if err := o.onPipelineFailed(ctx, env); err != nil {
+		if err = o.onPipelineFailed(ctx, envelope); err != nil {
 			return err
 		}
 	default:
-		return fmt.Errorf("unknown message type: %s", baseEnv.Type)
+		return fmt.Errorf("unknown message type: %s", baseEnvelope.Type)
 	}
 	return nil
+}
+
+type IncomingEventType interface {
+	events.ExtractCompleted | events.PrepareCompleted | events.Failed
 }
 
 func (o *Orchestrator) onExtractCompleted(ctx context.Context, env events.Envelope[events.ExtractCompleted]) error {
 	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
 		genericEnv := utils.ToGenericEnvelope(env)
 
-		if err := o.appendEvent(ctx, tx, genericEnv, env.Payload); err != nil {
+		if err := appendEvent(ctx, tx, env, env.Payload); err != nil {
 			return err
 		}
 
-		const q = `UPDATE saga_instances SET current_step='prepare', status='running', output = output || $2::jsonb WHERE saga_id=$1`
-		if _, err := tx.ExecContext(ctx, q, env.SagaID, utils.AsJSON(env.Payload)); err != nil {
+		// TODO: move it to constructor (if needed)
+		repo := storage.NewSagaInstancesRepo(tx)
+		sagaUUID, err := uuid.Parse(env.SagaID)
+		if err != nil {
+			return fmt.Errorf("invalid saga ID format: %w", err)
+		}
+
+		payloadJSON := utils.AsJSON(env.Payload)
+		var rawPayload json.RawMessage
+		if payloadJSON != nil {
+			rawPayload = json.RawMessage(*payloadJSON)
+		}
+
+		if err := repo.UpdateSagaInstanceStep(ctx, sagaUUID, "prepare", "running", rawPayload); err != nil {
 			return err
 		}
 
-		payloadJSON, _ := json.Marshal(env.Payload)
-		if err := o.publishNext(ctx, genericEnv, o.cfg.TopicPrepareRequest, payloadJSON); err != nil {
+		payloadBytes, _ := json.Marshal(env.Payload)
+		if err := o.publishNext(ctx, genericEnv, events.PipelinePrepareRequest, payloadBytes); err != nil {
 			return err
 		}
-		return o.publishStateChanged(ctx, env.SagaID, "running", "prepare", payloadJSON)
+		return o.publishStateChanged(ctx, env.SagaID, events.SagaStatusRunning, events.SagaStepPrepare, payloadBytes)
 	})
 }
 
 func (o *Orchestrator) onPrepareCompleted(ctx context.Context, env events.Envelope[events.PrepareCompleted]) error {
 	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
-		genericEnv := utils.ToGenericEnvelope(env)
-
-		if err := o.appendEvent(ctx, tx, genericEnv, env.Payload); err != nil {
+		if err := appendEvent(ctx, tx, env, env.Payload); err != nil {
 			return err
 		}
 
-		const q = `UPDATE saga_instances SET current_step='completed', status='completed', output = output || $2::jsonb WHERE saga_id=$1`
-		if _, err := tx.ExecContext(ctx, q, env.SagaID, utils.AsJSON(env.Payload)); err != nil {
+		repo := storage.NewSagaInstancesRepo(tx)
+		sagaUUID, err := uuid.Parse(env.SagaID)
+		if err != nil {
+			return fmt.Errorf("invalid saga ID format: %w", err)
+		}
+
+		payloadJSON := utils.AsJSON(env.Payload)
+		var rawPayload json.RawMessage
+		if payloadJSON != nil {
+			rawPayload = json.RawMessage(*payloadJSON)
+		}
+
+		if err := repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusCompleted, rawPayload); err != nil {
 			return err
 		}
-		payloadJSON, _ := json.Marshal(env.Payload)
-		return o.publishStateChanged(ctx, env.SagaID, "completed", "prepare", payloadJSON)
+		payloadBytes, _ := json.Marshal(env.Payload)
+		return o.publishStateChanged(ctx, env.SagaID, events.SagaStatusCompleted, events.SagaStepPrepare, payloadBytes)
 	})
 }
 
 func (o *Orchestrator) onPipelineFailed(ctx context.Context, env events.Envelope[events.Failed]) error {
 	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
-		genericEnv := utils.ToGenericEnvelope(env)
+		if err := appendEvent(ctx, tx, env, env.Payload); err != nil {
+			return err
+		}
+		repo := storage.NewSagaInstancesRepo(tx)
+		sagaUUID, err := uuid.Parse(env.SagaID)
+		if err != nil {
+			return fmt.Errorf("invalid saga ID format: %w", err)
+		}
 
-		if err := o.appendEvent(ctx, tx, genericEnv, env.Payload); err != nil {
+		payloadJSON := utils.AsJSON(env.Payload)
+		var rawPayload json.RawMessage
+		if payloadJSON != nil {
+			rawPayload = json.RawMessage(*payloadJSON)
+		}
+
+		if err := repo.UpdateSagaInstanceStatus(ctx, sagaUUID, events.SagaStatusFailed, rawPayload); err != nil {
 			return err
 		}
-		const q = `UPDATE saga_instances SET status='failed', error=$2 WHERE saga_id=$1`
-		if _, err := tx.ExecContext(ctx, q, env.SagaID, utils.AsJSON(env.Payload)); err != nil {
-			return err
-		}
-		payloadJSON, _ := json.Marshal(env.Payload)
-		return o.publishStateChanged(ctx, env.SagaID, "failed", "", payloadJSON)
+		payloadBytes, _ := json.Marshal(env.Payload)
+		// TODO: keep step empty or filled
+		return o.publishStateChanged(ctx, env.SagaID, events.SagaStatusFailed, "", payloadBytes)
 	})
 }
 
 func (o *Orchestrator) ensureProcessedNotExists(ctx context.Context, tx *sql.Tx, messageID string) error {
-	const ins = `INSERT INTO processed_messages(message_id) VALUES ($1)`
-	if _, err := tx.ExecContext(ctx, ins, messageID); err != nil {
+	repo := storage.NewProcessedMessagesRepo(tx)
+	messageUUID, err := uuid.Parse(messageID)
+	if err != nil {
+		return fmt.Errorf("invalid message ID format: %w", err)
+	}
+
+	if err := repo.InsertProcessedMessage(ctx, messageUUID); err != nil {
 		if utils.IsUniqueViolation(err) {
 			return db.ErrDuplicate
 		}
@@ -148,10 +199,32 @@ func (o *Orchestrator) ensureProcessedNotExists(ctx context.Context, tx *sql.Tx,
 	return nil
 }
 
-func (o *Orchestrator) appendEvent(ctx context.Context, tx *sql.Tx, env events.Envelope[any], payload any) error {
-	const ins = `INSERT INTO saga_events(saga_id, message_id, type, payload, occurred_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(message_id) DO NOTHING`
-	_, err := tx.ExecContext(ctx, ins, env.SagaID, env.MessageID, env.Type, utils.AsJSON(payload), env.OccurredAt)
-	return err
+func appendEvent[T IncomingEventType](ctx context.Context, tx *sql.Tx, env events.Envelope[T], payload T) error {
+	repo := storage.NewSagaRepo(tx)
+
+	sagaUUID, err := uuid.Parse(env.SagaID)
+	if err != nil {
+		return fmt.Errorf("invalid saga ID format: %w", err)
+	}
+
+	messageUUID, err := uuid.Parse(env.MessageID)
+	if err != nil {
+		return fmt.Errorf("invalid message ID format: %w", err)
+	}
+
+	payloadJSON := utils.AsJSON(payload)
+	var rawPayload json.RawMessage
+	if payloadJSON != nil {
+		rawPayload = json.RawMessage(*payloadJSON)
+	}
+
+	return repo.InsertEvent(ctx, storage.SagaEventRow{
+		SagaID:     sagaUUID,
+		MessageID:  messageUUID,
+		Type:       string(env.Type),
+		Payload:    rawPayload,
+		OccurredAt: env.OccurredAt,
+	})
 }
 
 func (o *Orchestrator) publishNext(ctx context.Context, env events.Envelope[any], topic string, payload json.RawMessage) error {
@@ -173,10 +246,10 @@ func (o *Orchestrator) publishNext(ctx context.Context, env events.Envelope[any]
 	return o.publish(ctx, topic, out)
 }
 
-func (o *Orchestrator) publishStateChanged(ctx context.Context, envSagaID string, status string, step string, contextPayload json.RawMessage) error {
-	payload := map[string]any{"status": status}
-	if step != "" {
-		payload["step"] = step
+func (o *Orchestrator) publishStateChanged(ctx context.Context, envSagaID string, status events.SagaStatus, step events.SagaStep, contextPayload json.RawMessage) error {
+	payload := map[string]any{
+		"status": status,
+		"step":   step,
 	}
 
 	var ctxMap map[string]any

@@ -144,7 +144,7 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 	env := events.Envelope[events.ExtractRequest]{
 		MessageID:  uuid.NewString(),
 		SagaID:     sagaID,
-		Type:       s.cfg.TopicExtractRequest,
+		Type:       events.PipelineExtractRequest,
 		OccurredAt: now,
 		Payload:    req,
 		Meta: events.Meta{

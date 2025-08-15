@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/quiby-ai/common/pkg/events"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"github.com/quiby-ai/saga-orchestrator/internal/config"
 	"github.com/quiby-ai/saga-orchestrator/internal/db"
 	"github.com/quiby-ai/saga-orchestrator/internal/httpserver"
-	"github.com/quiby-ai/saga-orchestrator/internal/kafka"
+	kafkax "github.com/quiby-ai/saga-orchestrator/internal/kafka"
 	"github.com/quiby-ai/saga-orchestrator/internal/orchestrator"
 )
 
@@ -32,15 +33,19 @@ func main() {
 		log.Fatalf("db migrate: %v", err)
 	}
 
-	producer := kafka.NewProducer(cfg)
-	defer func() { _ = producer.Close() }()
+	producer := kafkax.NewProducer(cfg)
+	defer func() {
+		_ = producer.Close()
+	}()
 
-	orcReader := kafka.NewConsumer(cfg, cfg.OrchestratorGroupID, []string{
-		cfg.TopicExtractCompleted,
-		cfg.TopicPrepareCompleted,
-		cfg.TopicPipelineFailed,
+	orcReader := kafkax.NewConsumer(cfg, cfg.OrchestratorGroupID, []string{
+		events.PipelineExtractCompleted,
+		events.PipelinePrepareCompleted,
+		events.PipelineFailed,
 	})
-	defer func() { _ = orcReader.Close() }()
+	defer func() {
+		_ = orcReader.Close()
+	}()
 
 	orc := orchestrator.NewOrchestrator(cfg, pg, producer)
 
@@ -53,7 +58,7 @@ func main() {
 	}()
 
 	go func() {
-		if err := kafka.RunConsumerLoop(ctx, orcReader, orc.HandleMessage); err != nil {
+		if err := kafkax.RunConsumerLoop(ctx, orcReader, orc.HandleMessage); err != nil {
 			log.Printf("orchestrator consumer stopped: %v", err)
 		}
 	}()
