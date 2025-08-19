@@ -10,14 +10,14 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/quiby-ai/saga-orchestrator/internal/config"
+	"github.com/quiby-ai/saga-orchestrator/config"
 )
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
 func Connect(ctx context.Context, cfg config.Config) (*sql.DB, error) {
-	db, err := sql.Open("pgx", cfg.PostgresURL)
+	db, err := sql.Open("pgx", cfg.Database.DSN)
 	if err != nil {
 		return nil, err
 	}

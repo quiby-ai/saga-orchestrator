@@ -9,16 +9,16 @@ import (
 	"github.com/quiby-ai/common/pkg/events"
 	"github.com/segmentio/kafka-go"
 
-	"github.com/quiby-ai/saga-orchestrator/internal/config"
+	"github.com/quiby-ai/saga-orchestrator/config"
 )
 
 type Producer struct {
 	w *kafka.Writer
 }
 
-func NewProducer(cfg config.Config) *Producer {
+func NewProducer(cfg config.KafkaConfig) *Producer {
 	w := kafka.NewWriter(kafka.WriterConfig{
-		Brokers:      cfg.KafkaBrokers,
+		Brokers:      cfg.Brokers,
 		Balancer:     &kafka.Hash{},
 		RequiredAcks: int(kafka.RequireAll),
 		Async:        false,
@@ -58,14 +58,14 @@ type Consumer struct {
 	r *kafka.Reader
 }
 
-func NewConsumer(cfg config.Config, groupID string, topics []string) *Consumer {
+func NewConsumer(cfg config.KafkaConfig, topics []string) *Consumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:               cfg.KafkaBrokers,
-		GroupID:               groupID,
+		Brokers:               cfg.Brokers,
+		GroupID:               cfg.Group,
 		GroupTopics:           topics,
-		MinBytes:              1,
-		MaxBytes:              10e6,
-		MaxWait:               500 * time.Millisecond,
+		MinBytes:              cfg.MinBytes,
+		MaxBytes:              cfg.MaxBytes,
+		MaxWait:               cfg.MaxWait,
 		CommitInterval:        0, // manual commit
 		ReadLagInterval:       -1,
 		WatchPartitionChanges: true,

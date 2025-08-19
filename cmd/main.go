@@ -2,15 +2,15 @@ package main
 
 import (
 	"context"
-	"github.com/quiby-ai/common/pkg/events"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/quiby-ai/saga-orchestrator/internal/config"
+	"github.com/quiby-ai/common/pkg/events"
+
+	"github.com/quiby-ai/saga-orchestrator/config"
 	"github.com/quiby-ai/saga-orchestrator/internal/db"
 	"github.com/quiby-ai/saga-orchestrator/internal/httpserver"
 	kafkax "github.com/quiby-ai/saga-orchestrator/internal/kafka"
@@ -23,22 +23,26 @@ func main() {
 
 	cfg := config.Load()
 
-	pg, err := db.Connect(ctx, cfg)
+	pg, err := db.Connect(ctx, *cfg)
 	if err != nil {
 		log.Fatalf("db connect: %v", err)
 	}
-	defer pg.Close()
+	defer func() {
+		if err := pg.Close(); err != nil {
+			log.Fatalf("db close: %v", err)
+		}
+	}()
 
 	if err := db.RunMigrations(ctx, pg); err != nil {
 		log.Fatalf("db migrate: %v", err)
 	}
 
-	producer := kafkax.NewProducer(cfg)
+	producer := kafkax.NewProducer(cfg.Kafka)
 	defer func() {
 		_ = producer.Close()
 	}()
 
-	orcReader := kafkax.NewConsumer(cfg, cfg.OrchestratorGroupID, []string{
+	orcReader := kafkax.NewConsumer(cfg.Kafka, []string{
 		events.PipelineExtractCompleted,
 		events.PipelinePrepareCompleted,
 		events.PipelineFailed,
@@ -47,9 +51,9 @@ func main() {
 		_ = orcReader.Close()
 	}()
 
-	orc := orchestrator.NewOrchestrator(cfg, pg, producer)
+	orc := orchestrator.NewOrchestrator(*cfg, pg, producer)
 
-	server := httpserver.NewServer(cfg, pg)
+	server := httpserver.NewServer(*cfg, pg)
 	server.InjectProducer(producer)
 	go func() {
 		if err := server.Start(); err != nil && err != http.ErrServerClosed {
@@ -67,7 +71,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
 }

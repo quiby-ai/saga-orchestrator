@@ -12,7 +12,7 @@ import (
 	"github.com/quiby-ai/common/pkg/events"
 	"github.com/segmentio/kafka-go"
 
-	"github.com/quiby-ai/saga-orchestrator/internal/config"
+	"github.com/quiby-ai/saga-orchestrator/config"
 	"github.com/quiby-ai/saga-orchestrator/internal/db"
 	"github.com/quiby-ai/saga-orchestrator/internal/storage"
 	"github.com/quiby-ai/saga-orchestrator/internal/utils"
@@ -174,7 +174,7 @@ func (o *Orchestrator) processSagaEvent(
 		}
 
 		// Publish state change
-		return o.publishStateChanged(ctx, env.SagaID, status, step, rawPayload)
+		return o.publishStateChanged(ctx, env.SagaID, status, step)
 	})
 }
 
@@ -225,40 +225,24 @@ func (o *Orchestrator) ensureProcessedNotExists(ctx context.Context, tx *sql.Tx,
 }
 
 // publishStateChanged publishes a state change event
-func (o *Orchestrator) publishStateChanged(ctx context.Context, sagaID string, status events.SagaStatus, step events.SagaStep, contextPayload json.RawMessage) error {
-	payload := map[string]any{
-		"status": status,
-		"step":   step,
-	}
-
-	// Extract context if available
-	if contextPayload != nil {
-		var ctxMap map[string]any
-		if err := json.Unmarshal(contextPayload, &ctxMap); err == nil {
-			if count, ok := ctxMap["count"]; ok {
-				payload["context"] = map[string]any{"count": count}
-			}
-		}
-	}
-
-	payloadBytes, err := json.Marshal(map[string]any{"payload": payload})
-	if err != nil {
-		return fmt.Errorf("failed to marshal state change payload: %w", err)
-	}
-
-	envelope := events.Envelope[any]{
+func (o *Orchestrator) publishStateChanged(ctx context.Context, sagaID string, status events.SagaStatus, step events.SagaStep) error {
+	envelope := events.Envelope[events.StateChanged]{
 		MessageID:  uuid.NewString(),
 		SagaID:     sagaID,
-		Type:       o.cfg.TopicStateChanged,
+		Type:       events.SagaStateChanged,
 		OccurredAt: time.Now().UTC(),
-		Payload:    payloadBytes,
+		Payload: events.StateChanged{
+			Status:  status,
+			Step:    step,
+			Context: events.StateChangedContext{Message: "Quiby is doing something..."},
+		},
 		Meta: events.Meta{
-			AppID:         o.cfg.AppID,
+			AppID:         o.cfg.App.ID,
 			SchemaVersion: events.SchemaVersionV1,
 		},
 	}
 
-	return o.publish(ctx, o.cfg.TopicStateChanged, envelope)
+	return o.publish(ctx, events.SagaStateChanged, convertToAnyEnvelope(envelope))
 }
 
 // publish publishes an event to Kafka

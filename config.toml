@@ -1,0 +1,17 @@
+[app]
+id = "saga-orchestrator"
+
+[kafka]
+brokers = ["kafka:9092"]
+group = "saga-orchestrator-orc"
+max_wait = "500ms"
+min_bytes = 1
+# max_bytes = 10MB
+max_bytes = 10485760
+
+[http]
+addr = ":8082"
+shutdown_timeout = "10s"
+
+[database]
+# configured via PG_DSN environment variable

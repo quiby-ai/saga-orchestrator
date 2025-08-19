@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/quiby-ai/common/pkg/events"
-	"github.com/quiby-ai/saga-orchestrator/internal/config"
+	"github.com/quiby-ai/saga-orchestrator/config"
 	"github.com/quiby-ai/saga-orchestrator/internal/utils"
 )
 
@@ -31,7 +31,7 @@ func NewServer(cfg config.Config, db *sql.DB) *Server {
 		cfg: cfg,
 		db:  db,
 		http: &http.Server{
-			Addr:    cfg.HTTPAddr,
+			Addr:    cfg.HTTP.Addr,
 			Handler: mux,
 		},
 	}
@@ -129,7 +129,7 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 			Context: events.StateChangedContext{Message: "Quiby is extracting reviews..."},
 		},
 		Meta: events.Meta{
-			AppID:         s.cfg.AppID,
+			AppID:         s.cfg.App.ID,
 			TenantID:      tenantID,
 			Initiator:     events.InitiatorUser,
 			SchemaVersion: events.SchemaVersionV1,
@@ -138,7 +138,7 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 
 	if s.prod != nil {
 		genericEnv := utils.ToGenericEnvelope(stateEnv)
-		_ = s.prod.PublishEvent(r.Context(), s.cfg.TopicStateChanged, []byte(sagaID), genericEnv)
+		_ = s.prod.PublishEvent(r.Context(), events.SagaStateChanged, []byte(sagaID), genericEnv)
 	}
 
 	env := events.Envelope[events.ExtractRequest]{
@@ -148,7 +148,7 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 		OccurredAt: now,
 		Payload:    req,
 		Meta: events.Meta{
-			AppID:         s.cfg.AppID,
+			AppID:         s.cfg.App.ID,
 			TenantID:      tenantID,
 			Initiator:     events.InitiatorUser,
 			SchemaVersion: events.SchemaVersionV1,
@@ -157,7 +157,7 @@ func (s *Server) handleStartSaga(w http.ResponseWriter, r *http.Request) {
 
 	if s.prod != nil {
 		genericEnv := utils.ToGenericEnvelope(env)
-		_ = s.prod.PublishEvent(r.Context(), s.cfg.TopicExtractRequest, []byte(env.SagaID), genericEnv)
+		_ = s.prod.PublishEvent(r.Context(), events.PipelineExtractRequest, []byte(env.SagaID), genericEnv)
 	}
 
 	utils.WriteJSON(w, http.StatusOK, startResponse{SagaID: sagaID, Status: "running"})

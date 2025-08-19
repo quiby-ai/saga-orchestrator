@@ -4,6 +4,4 @@
 
 .env
 
-config.toml
-
 internal/storage/sqlc/*.go
