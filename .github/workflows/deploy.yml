@@ -19,11 +19,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_TOKEN }}
 
+      - name: Set environment variables
+        id: env
+        run: |
+          echo "PG_DSN=${{ secrets.PG_DSN }}" >> $GITHUB_ENV
+  
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          build-args: |
+            PG_DSN=${{ env.PG_DSN }}
           tags: |
             ghcr.io/quiby-ai/saga-orchestrator:${{ github.sha }}
             ghcr.io/quiby-ai/saga-orchestrator:main
