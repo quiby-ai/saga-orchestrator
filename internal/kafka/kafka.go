@@ -84,6 +84,7 @@ func RunConsumerLoop(ctx context.Context, c *Consumer, handler func(context.Cont
 			}
 			return err
 		}
+		fmt.Printf("got message: %v\n", m)
 		hErr := handler(ctx, m)
 		if hErr != nil {
 			// Handler is responsible for publishing retry/DLQ and deciding whether to commit.
