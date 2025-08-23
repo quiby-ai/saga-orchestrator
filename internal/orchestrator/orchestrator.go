@@ -98,6 +98,8 @@ func (o *Orchestrator) handleExtractCompleted(ctx context.Context, msgValue []by
 		return fmt.Errorf("failed to unmarshal extract completed envelope: %w", err)
 	}
 
+	fmt.Printf("got envelope: %v\n", envelope)
+
 	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
 		repo := storage.NewSagaInstancesRepo(tx)
 		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusRunning, payload)
