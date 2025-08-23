@@ -97,13 +97,35 @@ func (o *Orchestrator) handleExtractCompleted(ctx context.Context, msgValue []by
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal extract completed envelope: %w", err)
 	}
-
 	fmt.Printf("got envelope: %v\n", envelope)
+	extractRequest := envelope.Payload
 
 	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
 		repo := storage.NewSagaInstancesRepo(tx)
 		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusRunning, payload)
-	}, events.SagaStatusRunning, events.SagaStepPrepare)
+	}, events.SagaStatusRunning, events.SagaStepPrepare, func(ctx context.Context, sagaID string) error {
+		prepareEnv := events.Envelope[events.PrepareRequest]{
+			MessageID:  uuid.NewString(),
+			SagaID:     sagaID,
+			Type:       events.PipelinePrepareRequest,
+			OccurredAt: time.Now().UTC(),
+			Payload: events.PrepareRequest{
+				ExtractRequest: events.ExtractRequest{
+					AppID:     extractRequest.AppID,
+					AppName:   extractRequest.AppName,
+					Countries: extractRequest.Countries,
+					DateFrom:  extractRequest.DateFrom,
+					DateTo:    extractRequest.DateTo,
+				},
+			},
+			Meta: events.Meta{
+				AppID:         o.cfg.App.ID,
+				SchemaVersion: events.SchemaVersionV1,
+			},
+		}
+
+		return o.publish(ctx, events.PipelinePrepareRequest, convertToAnyEnvelope(prepareEnv))
+	})
 }
 
 // handlePrepareCompleted processes prepare completed events
@@ -112,11 +134,12 @@ func (o *Orchestrator) handlePrepareCompleted(ctx context.Context, msgValue []by
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal prepare completed envelope: %w", err)
 	}
+	fmt.Printf("got envelope: %v\n", envelope)
 
 	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
 		repo := storage.NewSagaInstancesRepo(tx)
 		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusCompleted, payload)
-	}, events.SagaStatusCompleted, events.SagaStepPrepare)
+	}, events.SagaStatusCompleted, events.SagaStepPrepare, nil)
 }
 
 // handlePipelineFailed processes pipeline failed events
@@ -129,7 +152,7 @@ func (o *Orchestrator) handlePipelineFailed(ctx context.Context, msgValue []byte
 	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
 		repo := storage.NewSagaInstancesRepo(tx)
 		return repo.UpdateSagaInstanceStatus(ctx, sagaUUID, events.SagaStatusFailed, payload)
-	}, events.SagaStatusFailed, "")
+	}, events.SagaStatusFailed, "", nil)
 }
 
 // convertToAnyEnvelope converts a typed envelope to an any envelope
@@ -152,6 +175,7 @@ func (o *Orchestrator) processSagaEvent(
 	updateFn func(context.Context, *sql.Tx, uuid.UUID, json.RawMessage) error,
 	status events.SagaStatus,
 	step events.SagaStep,
+	postUpdateFn func(context.Context, string) error,
 ) error {
 	return utils.WithTx(ctx, o.db, func(tx *sql.Tx) error {
 		// Store the event
@@ -176,7 +200,18 @@ func (o *Orchestrator) processSagaEvent(
 		}
 
 		// Publish state change
-		return o.publishStateChanged(ctx, env.SagaID, status, step)
+		if err := o.publishStateChanged(ctx, env.SagaID, status, step); err != nil {
+			return err
+		}
+
+		// Call post-update function if provided
+		if postUpdateFn != nil {
+			if err := postUpdateFn(ctx, env.SagaID); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 }
 
