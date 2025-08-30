@@ -78,9 +78,10 @@ func (o *Orchestrator) routeMessage(ctx context.Context, msg kafka.Message) erro
 	}
 
 	handlers := map[string]func(context.Context, []byte) error{
-		events.PipelineExtractCompleted: o.handleExtractCompleted,
-		events.PipelinePrepareCompleted: o.handlePrepareCompleted,
-		events.PipelineFailed:           o.handlePipelineFailed,
+		events.PipelineExtractCompleted:   o.handleExtractCompleted,
+		events.PipelinePrepareCompleted:   o.handlePrepareCompleted,
+		events.PipelineVectorizeCompleted: o.handleVectorizeCompleted,
+		events.PipelineFailed:             o.handlePipelineFailed,
 	}
 
 	handler, exists := handlers[baseEnvelope.Type]
@@ -135,11 +136,48 @@ func (o *Orchestrator) handlePrepareCompleted(ctx context.Context, msgValue []by
 		return fmt.Errorf("failed to unmarshal prepare completed envelope: %w", err)
 	}
 	fmt.Printf("got envelope: %v\n", envelope)
+	prepareRequest := envelope.Payload
 
 	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
 		repo := storage.NewSagaInstancesRepo(tx)
-		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepPrepare, events.SagaStatusCompleted, payload)
-	}, events.SagaStatusCompleted, events.SagaStepPrepare, nil)
+		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepVectorize, events.SagaStatusRunning, payload)
+	}, events.SagaStatusRunning, events.SagaStepVectorize, func(ctx context.Context, sagaID string) error {
+		vectorizeEnv := events.Envelope[events.VectorizeRequest]{
+			MessageID:  uuid.NewString(),
+			SagaID:     sagaID,
+			Type:       events.PipelineVectorizeRequest,
+			OccurredAt: time.Now().UTC(),
+			Payload: events.VectorizeRequest{
+				ExtractRequest: events.ExtractRequest{
+					AppID:     prepareRequest.ExtractRequest.AppID,
+					AppName:   prepareRequest.ExtractRequest.AppName,
+					Countries: prepareRequest.ExtractRequest.Countries,
+					DateFrom:  prepareRequest.ExtractRequest.DateFrom,
+					DateTo:    prepareRequest.ExtractRequest.DateTo,
+				},
+			},
+			Meta: events.Meta{
+				AppID:         o.cfg.App.ID,
+				SchemaVersion: events.SchemaVersionV1,
+			},
+		}
+
+		return o.publish(ctx, events.PipelineVectorizeRequest, convertToAnyEnvelope(vectorizeEnv))
+	})
+}
+
+// handleVectorizeCompleted processes vectorize completed events
+func (o *Orchestrator) handleVectorizeCompleted(ctx context.Context, msgValue []byte) error {
+	envelope, err := events.UnmarshalEnvelope[events.VectorizeCompleted](msgValue)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal prepare completed envelope: %w", err)
+	}
+	fmt.Printf("got envelope: %v\n", envelope)
+
+	return o.processSagaEvent(ctx, convertToAnyEnvelope(envelope), func(ctx context.Context, tx *sql.Tx, sagaUUID uuid.UUID, payload json.RawMessage) error {
+		repo := storage.NewSagaInstancesRepo(tx)
+		return repo.UpdateSagaInstanceStep(ctx, sagaUUID, events.SagaStepVectorize, events.SagaStatusCompleted, payload)
+	}, events.SagaStatusCompleted, events.SagaStepVectorize, nil)
 }
 
 // handlePipelineFailed processes pipeline failed events
