@@ -45,6 +45,7 @@ func main() {
 	orcReader := kafkax.NewConsumer(cfg.Kafka, []string{
 		events.PipelineExtractCompleted,
 		events.PipelinePrepareCompleted,
+		events.PipelineVectorizeCompleted,
 		events.PipelineFailed,
 	})
 	defer func() {

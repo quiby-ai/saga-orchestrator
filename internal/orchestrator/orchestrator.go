@@ -238,13 +238,13 @@ func (o *Orchestrator) processSagaEvent(
 		}
 
 		// Publish state change
-		if err := o.publishStateChanged(ctx, env.SagaID, status, step); err != nil {
+		if err = o.publishStateChanged(ctx, env.SagaID, status, step); err != nil {
 			return err
 		}
 
 		// Call post-update function if provided
 		if postUpdateFn != nil {
-			if err := postUpdateFn(ctx, env.SagaID); err != nil {
+			if err = postUpdateFn(ctx, env.SagaID); err != nil {
 				return err
 			}
 		}
